@@ -6,7 +6,16 @@ import { runMonteCarloSimulation } from '@/lib/simulation';
 import { FundConfig } from '@/components/FundConfig';
 import { SimulationResults } from '@/components/SimulationResults';
 import { Portfolio } from '@/components/Portfolio';
-import { Play, BarChart2, Briefcase, Settings } from 'lucide-react';
+import {
+  fetchFund,
+  saveFundParams,
+  fetchInvestments,
+  createInvestmentApi,
+  updateInvestmentApi,
+  deleteInvestmentApi,
+  addValuationApi,
+} from '@/lib/api';
+import { Play, BarChart2, Briefcase, Settings, Database, AlertCircle } from 'lucide-react';
 
 type Tab = 'simulation' | 'portfolio' | 'config';
 
@@ -17,12 +26,37 @@ export default function Home() {
   const [isRunning, setIsRunning] = useState(false);
   const [numSimulations, setNumSimulations] = useState(5000);
 
-  // Portfolio state (in-memory for now, will connect to Supabase)
+  // Database state
+  const [fundId, setFundId] = useState<string | null>(null);
+  const [dbConnected, setDbConnected] = useState<boolean | null>(null);
+  const [dbError, setDbError] = useState<string | null>(null);
+
+  // Portfolio state
   const [investments, setInvestments] = useState<Investment[]>([]);
+  const [isLoadingInvestments, setIsLoadingInvestments] = useState(false);
+
+  // Load fund and investments from database on mount
+  useEffect(() => {
+    async function loadData() {
+      try {
+        const fund = await fetchFund();
+        setFundId(fund.id);
+        setParams(fund.params as FundParams);
+        setDbConnected(true);
+
+        const invs = await fetchInvestments(fund.id);
+        setInvestments(invs);
+      } catch (error) {
+        console.log('Database not configured, using local state:', error);
+        setDbConnected(false);
+        setDbError('Database not configured. Data will not persist.');
+      }
+    }
+    loadData();
+  }, []);
 
   const runSimulation = useCallback(() => {
     setIsRunning(true);
-    // Run in setTimeout to allow UI to update
     setTimeout(() => {
       const simulationResults = runMonteCarloSimulation(params, numSimulations);
       setResults(simulationResults);
@@ -35,7 +69,37 @@ export default function Home() {
     runSimulation();
   }, []);
 
-  const handleAddInvestment = (data: Omit<Investment, 'id' | 'createdAt' | 'updatedAt' | 'totalInvested'>) => {
+  // Save params when they change (debounced)
+  useEffect(() => {
+    if (!fundId || !dbConnected) return;
+
+    const timer = setTimeout(() => {
+      saveFundParams(fundId, params).catch(console.error);
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [params, fundId, dbConnected]);
+
+  const handleAddInvestment = async (
+    data: Omit<Investment, 'id' | 'createdAt' | 'updatedAt' | 'totalInvested'>
+  ) => {
+    if (dbConnected && fundId) {
+      try {
+        const newInvestment = await createInvestmentApi(fundId, data);
+        setInvestments([newInvestment, ...investments]);
+      } catch (error) {
+        console.error('Failed to create investment:', error);
+        // Fall back to local
+        addLocalInvestment(data);
+      }
+    } else {
+      addLocalInvestment(data);
+    }
+  };
+
+  const addLocalInvestment = (
+    data: Omit<Investment, 'id' | 'createdAt' | 'updatedAt' | 'totalInvested'>
+  ) => {
     const newInvestment: Investment = {
       ...data,
       id: crypto.randomUUID(),
@@ -43,38 +107,87 @@ export default function Home() {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    setInvestments([...investments, newInvestment]);
+    setInvestments([newInvestment, ...investments]);
   };
 
-  const handleUpdateInvestment = (id: string, updates: Partial<Investment>) => {
-    setInvestments(investments.map(inv => {
-      if (inv.id === id) {
-        const updated = { ...inv, ...updates, updatedAt: new Date().toISOString() };
-        updated.totalInvested = updated.discoveryAmount + updated.convictionAmount + updated.followOnAmount;
-        return updated;
+  const handleUpdateInvestment = async (id: string, updates: Partial<Investment>) => {
+    if (dbConnected) {
+      try {
+        const updated = await updateInvestmentApi(id, updates);
+        setInvestments(investments.map((inv) => (inv.id === id ? updated : inv)));
+      } catch (error) {
+        console.error('Failed to update investment:', error);
+        updateLocalInvestment(id, updates);
       }
-      return inv;
-    }));
-  };
-
-  const handleDeleteInvestment = (id: string) => {
-    if (confirm('Are you sure you want to delete this investment?')) {
-      setInvestments(investments.filter(inv => inv.id !== id));
+    } else {
+      updateLocalInvestment(id, updates);
     }
   };
 
-  const handleAddValuation = (investmentId: string, valuation: number, date: string) => {
-    setInvestments(investments.map(inv => {
-      if (inv.id === investmentId) {
-        return {
-          ...inv,
-          currentValuation: valuation,
-          lastValuationDate: date,
-          updatedAt: new Date().toISOString(),
-        };
+  const updateLocalInvestment = (id: string, updates: Partial<Investment>) => {
+    setInvestments(
+      investments.map((inv) => {
+        if (inv.id === id) {
+          const updated = { ...inv, ...updates, updatedAt: new Date().toISOString() };
+          updated.totalInvested =
+            updated.discoveryAmount + updated.convictionAmount + updated.followOnAmount;
+          return updated;
+        }
+        return inv;
+      })
+    );
+  };
+
+  const handleDeleteInvestment = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this investment?')) return;
+
+    if (dbConnected) {
+      try {
+        await deleteInvestmentApi(id);
+        setInvestments(investments.filter((inv) => inv.id !== id));
+      } catch (error) {
+        console.error('Failed to delete investment:', error);
       }
-      return inv;
-    }));
+    } else {
+      setInvestments(investments.filter((inv) => inv.id !== id));
+    }
+  };
+
+  const handleAddValuation = async (
+    investmentId: string,
+    valuation: number,
+    date: string,
+    notes?: string
+  ) => {
+    if (dbConnected) {
+      try {
+        await addValuationApi(investmentId, valuation, date, notes);
+        // Refresh investment data
+        const invs = await fetchInvestments(fundId!);
+        setInvestments(invs);
+      } catch (error) {
+        console.error('Failed to add valuation:', error);
+        updateLocalValuation(investmentId, valuation, date);
+      }
+    } else {
+      updateLocalValuation(investmentId, valuation, date);
+    }
+  };
+
+  const updateLocalValuation = (investmentId: string, valuation: number, date: string) => {
+    setInvestments(
+      investments.map((inv) => {
+        if (inv.id === investmentId) {
+          return {
+            ...inv,
+            currentValuation: valuation,
+            lastValuationDate: date,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+        return inv;
+      })
+    );
   };
 
   return (
@@ -88,6 +201,27 @@ export default function Home() {
               <p className="text-sm text-gray-400">Monte Carlo analysis for VC fund outcomes</p>
             </div>
             <div className="flex items-center gap-4">
+              {/* Database status indicator */}
+              <div
+                className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded ${
+                  dbConnected === null
+                    ? 'bg-gray-800 text-gray-400'
+                    : dbConnected
+                    ? 'bg-green-900/50 text-green-400'
+                    : 'bg-yellow-900/50 text-yellow-400'
+                }`}
+                title={dbConnected ? 'Connected to database' : dbError || 'Checking connection...'}
+              >
+                {dbConnected === null ? (
+                  <div className="w-2 h-2 rounded-full bg-gray-400 animate-pulse" />
+                ) : dbConnected ? (
+                  <Database size={12} />
+                ) : (
+                  <AlertCircle size={12} />
+                )}
+                {dbConnected === null ? 'Connecting...' : dbConnected ? 'Synced' : 'Local only'}
+              </div>
+
               <div className="flex items-center gap-2">
                 <label className="text-sm text-gray-400">Simulations:</label>
                 <select
@@ -195,9 +329,7 @@ function TabButton({
     <button
       onClick={onClick}
       className={`flex items-center gap-2 px-4 py-3 text-sm font-medium transition-colors ${
-        active
-          ? 'text-white border-b-2 border-blue-500'
-          : 'text-gray-400 hover:text-white'
+        active ? 'text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white'
       }`}
     >
       {icon}
