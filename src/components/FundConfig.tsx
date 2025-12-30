@@ -36,7 +36,7 @@ export function FundConfig({ params, onChange }: FundConfigProps) {
   }).reduce((a, b) => a + b, 0);
 
   const investableCapital = params.fundSize - totalFees;
-  const followOnReserve = params.fundSize * params.followOnReservePercent;
+  const followOnReserve = investableCapital * params.followOnReservePercent;
   const deployableCapital = investableCapital - followOnReserve;
 
   const discoveryTotal = params.maxDiscoveryChecks * params.discoveryCheckSize;

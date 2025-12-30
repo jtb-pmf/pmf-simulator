@@ -29,64 +29,188 @@ class SeededRandom {
 }
 
 /**
- * Outcome distribution for discovery-only companies (didn't graduate to conviction)
- * Higher failure rate, lower upside since these weren't selected for conviction
+ * Outcome distribution parameters that vary based on fund configuration.
  *
- * Based on seed/pre-seed benchmarks:
- * - ~70% fail (0x)
- * - ~20% return 0.5-2x
- * - ~7% return 2-5x
- * - ~3% return 5x+
+ * Key insight: Selectivity (graduation rate) affects conviction quality.
+ * - Lower graduation rate (e.g., 15%) = more selective = better conviction outcomes
+ * - Higher graduation rate (e.g., 35%) = less selective = worse conviction outcomes
+ *
+ * Base case assumes 25% graduation rate.
  */
-function sampleDiscoveryOnlyMultiple(rng: SeededRandom): number {
-  const r = rng.random();
+interface OutcomeParams {
+  // Discovery-only (companies that don't graduate)
+  discoveryFailRate: number;      // % that return 0x
+  discoveryLowReturnRate: number; // % that return 0.5-2x
+  discoveryMidReturnRate: number; // % that return 2-5x
+  discoveryHighReturnRate: number; // % that return 5-10x
+  discoveryOutlierRate: number;   // % that return 10x+
 
-  if (r < 0.70) {
-    return 0.0;        // 70% fail completely
-  } else if (r < 0.85) {
-    return 0.5 + rng.random() * 1.5; // 15% return 0.5-2x
-  } else if (r < 0.92) {
-    return 2.0 + rng.random() * 3.0; // 7% return 2-5x
-  } else if (r < 0.97) {
-    return 5.0 + rng.random() * 5.0; // 5% return 5-10x
-  } else if (r < 0.99) {
-    return 10.0 + rng.random() * 10.0; // 2% return 10-20x
-  } else {
-    return 20.0 + rng.random() * 30.0; // 1% return 20-50x
-  }
+  // Conviction (companies that graduate)
+  convictionFailRate: number;
+  convictionLowReturnRate: number;  // ~1x
+  convictionMidReturnRate: number;  // ~3x
+  convictionGoodReturnRate: number; // ~7x
+  convictionGreatReturnRate: number; // ~20x
+  convictionOutlierRate: number;    // 40x+
+  convictionMegaOutlierRate: number; // 100x+
+
+  // Multiplier ranges for conviction
+  convictionGreatMultiplierBase: number;
+  convictionOutlierMultiplierBase: number;
+  convictionMegaOutlierMultiplierBase: number;
 }
 
 /**
- * Outcome distribution for conviction companies (graduated from discovery)
- * Better outcomes since these are pre-selected top ~25%
+ * Calculate outcome parameters based on fund configuration.
  *
- * Conviction companies have stronger outcomes:
- * - ~50% fail (0x)
- * - ~27% return ~1x
- * - ~12% return ~3x
- * - ~6% return ~7x
- * - ~3.5% return ~20x
- * - ~1% return ~40x
- * - ~0.5% return 100x+
+ * Selectivity bonus: Lower graduation rates mean you're picking better companies.
+ * Formula: selectivityBonus = (0.25 - graduationRate) / 0.25
+ *   - At 25% graduation: bonus = 0 (baseline)
+ *   - At 15% graduation: bonus = 0.4 (40% improvement)
+ *   - At 35% graduation: bonus = -0.4 (40% worse)
  */
-function sampleConvictionMultiple(rng: SeededRandom): number {
-  const r = rng.random();
+function calculateOutcomeParams(params: FundParams): OutcomeParams {
+  const { graduationRate, followOnReservePercent, fundSize } = params;
 
-  if (r < 0.50) {
-    return 0.0;        // 50% fail
-  } else if (r < 0.77) {
-    return 0.8 + rng.random() * 0.4; // 27% ~ capital back (0.8-1.2x)
-  } else if (r < 0.89) {
-    return 2.5 + rng.random() * 1.5; // 12% ~3x (2.5-4x)
-  } else if (r < 0.95) {
-    return 5.0 + rng.random() * 5.0; // 6% ~7x (5-10x)
-  } else if (r < 0.985) {
-    return 15.0 + rng.random() * 10.0; // 3.5% ~20x (15-25x)
-  } else if (r < 0.995) {
-    return 30.0 + rng.random() * 20.0; // 1% ~40x (30-50x)
-  } else {
-    return 75.0 + rng.random() * 75.0; // 0.5% mega-outlier (75-150x)
+  // Selectivity bonus: how much better/worse are conviction picks vs baseline
+  // Baseline is 25% graduation rate
+  const baselineGraduationRate = 0.25;
+  const selectivityBonus = (baselineGraduationRate - graduationRate) / baselineGraduationRate;
+
+  // Follow-on bonus: larger reserves let you double down on winners
+  // Baseline is 20% reserves
+  const baselineFollowOn = 0.20;
+  const followOnBonus = (followOnReservePercent - baselineFollowOn) / baselineFollowOn * 0.5;
+
+  // Scale bonus: larger funds have more dry powder for follow-ons
+  // Baseline is $25M
+  const baselineFundSize = 25_000_000;
+  const scaleBonus = Math.log(fundSize / baselineFundSize) * 0.1;
+
+  // Combined conviction quality bonus (capped at reasonable range)
+  const qualityBonus = Math.max(-0.3, Math.min(0.5, selectivityBonus + followOnBonus * 0.3 + scaleBonus * 0.2));
+
+  // Discovery-only outcomes (these don't graduate, so they're the "rejected" companies)
+  // Higher selectivity means discovery-only companies are worse (you filtered out the good ones)
+  const discoveryPenalty = selectivityBonus * 0.1; // Small effect
+
+  return {
+    // Discovery-only: baseline from seed benchmarks, slightly affected by selectivity
+    discoveryFailRate: Math.min(0.80, 0.70 + discoveryPenalty * 0.1),
+    discoveryLowReturnRate: 0.15,
+    discoveryMidReturnRate: 0.07 - discoveryPenalty * 0.02,
+    discoveryHighReturnRate: 0.05 - discoveryPenalty * 0.02,
+    discoveryOutlierRate: 0.03 - discoveryPenalty * 0.01,
+
+    // Conviction: significantly affected by selectivity
+    // More selective = lower fail rate, higher outlier rates
+    convictionFailRate: Math.max(0.35, Math.min(0.60, 0.50 - qualityBonus * 0.15)),
+    convictionLowReturnRate: 0.27 - qualityBonus * 0.05,
+    convictionMidReturnRate: 0.12 + qualityBonus * 0.02,
+    convictionGoodReturnRate: 0.06 + qualityBonus * 0.02,
+    convictionGreatReturnRate: 0.035 + qualityBonus * 0.015,
+    convictionOutlierRate: 0.01 + qualityBonus * 0.005,
+    convictionMegaOutlierRate: 0.005 + qualityBonus * 0.003,
+
+    // Multiplier bases: better selectivity = higher potential multiples
+    convictionGreatMultiplierBase: 15 + qualityBonus * 5,
+    convictionOutlierMultiplierBase: 30 + qualityBonus * 15,
+    convictionMegaOutlierMultiplierBase: 75 + qualityBonus * 25,
+  };
+}
+
+/**
+ * Sample outcome for discovery-only companies
+ */
+function sampleDiscoveryOnlyMultiple(rng: SeededRandom, outcomeParams: OutcomeParams): number {
+  const r = rng.random();
+  const {
+    discoveryFailRate,
+    discoveryLowReturnRate,
+    discoveryMidReturnRate,
+    discoveryHighReturnRate,
+  } = outcomeParams;
+
+  let cumulative = 0;
+
+  cumulative += discoveryFailRate;
+  if (r < cumulative) {
+    return 0.0; // Fail
   }
+
+  cumulative += discoveryLowReturnRate;
+  if (r < cumulative) {
+    return 0.5 + rng.random() * 1.5; // 0.5-2x
+  }
+
+  cumulative += discoveryMidReturnRate;
+  if (r < cumulative) {
+    return 2.0 + rng.random() * 3.0; // 2-5x
+  }
+
+  cumulative += discoveryHighReturnRate;
+  if (r < cumulative) {
+    return 5.0 + rng.random() * 5.0; // 5-10x
+  }
+
+  // Outlier
+  if (rng.random() < 0.3) {
+    return 10.0 + rng.random() * 10.0; // 10-20x
+  }
+  return 20.0 + rng.random() * 30.0; // 20-50x
+}
+
+/**
+ * Sample outcome for conviction companies
+ */
+function sampleConvictionMultiple(rng: SeededRandom, outcomeParams: OutcomeParams): number {
+  const r = rng.random();
+  const {
+    convictionFailRate,
+    convictionLowReturnRate,
+    convictionMidReturnRate,
+    convictionGoodReturnRate,
+    convictionGreatReturnRate,
+    convictionOutlierRate,
+    convictionGreatMultiplierBase,
+    convictionOutlierMultiplierBase,
+    convictionMegaOutlierMultiplierBase,
+  } = outcomeParams;
+
+  let cumulative = 0;
+
+  cumulative += convictionFailRate;
+  if (r < cumulative) {
+    return 0.0; // Fail
+  }
+
+  cumulative += convictionLowReturnRate;
+  if (r < cumulative) {
+    return 0.8 + rng.random() * 0.4; // ~1x (0.8-1.2x)
+  }
+
+  cumulative += convictionMidReturnRate;
+  if (r < cumulative) {
+    return 2.5 + rng.random() * 1.5; // ~3x (2.5-4x)
+  }
+
+  cumulative += convictionGoodReturnRate;
+  if (r < cumulative) {
+    return 5.0 + rng.random() * 5.0; // ~7x (5-10x)
+  }
+
+  cumulative += convictionGreatReturnRate;
+  if (r < cumulative) {
+    return convictionGreatMultiplierBase + rng.random() * 10.0; // ~20x
+  }
+
+  cumulative += convictionOutlierRate;
+  if (r < cumulative) {
+    return convictionOutlierMultiplierBase + rng.random() * 20.0; // ~40x
+  }
+
+  // Mega-outlier
+  return convictionMegaOutlierMultiplierBase + rng.random() * 75.0; // 75-150x+
 }
 
 /**
@@ -120,7 +244,6 @@ function calculateIRR(cashFlows: number[], guess: number = 0.1): number {
 
     const newRate = rate - npv / dnpv;
 
-    // Bound the rate to reasonable values
     if (newRate < -0.99) {
       rate = -0.99;
     } else if (newRate > 10) {
@@ -130,7 +253,6 @@ function calculateIRR(cashFlows: number[], guess: number = 0.1): number {
     }
   }
 
-  // Fallback: binary search if Newton-Raphson fails
   return binarySearchIRR(cashFlows);
 }
 
@@ -148,7 +270,7 @@ function binarySearchIRR(cashFlows: number[]): number {
   const npvHigh = npv(high);
 
   if (npvLow * npvHigh > 0) {
-    return NaN; // No solution in range
+    return NaN;
   }
 
   for (let i = 0; i < maxIterations; i++) {
@@ -176,6 +298,9 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
   const { fundLife, fundSize, mgmtFeeRate, mgmtFeeFullYears, mgmtFeeStepdown, carry } = params;
   const { discoveryCheckSize, maxDiscoveryChecks, convictionCheckSize, graduationRate, followOnReservePercent } = params;
 
+  // Calculate outcome parameters based on fund configuration
+  const outcomeParams = calculateOutcomeParams(params);
+
   // Calculate management fees over fund life
   let totalFees = 0;
   for (let year = 1; year <= fundLife; year++) {
@@ -188,37 +313,30 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
 
   const investableCapital = fundSize - totalFees;
 
-  // Calculate follow-on reserve
-  const followOnReserve = fundSize * followOnReservePercent;
+  // Calculate follow-on reserve as % of investable capital (not fund size)
+  const followOnReserve = investableCapital * followOnReservePercent;
   const deployableCapital = investableCapital - followOnReserve;
 
   // Number of companies at each stage
   const numDiscovery = maxDiscoveryChecks;
   const numConviction = Math.round(numDiscovery * graduationRate);
 
-  // Check if we have enough capital
+  // Capital allocation
   const discoveryTotal = numDiscovery * discoveryCheckSize;
   const convictionTotal = numConviction * convictionCheckSize;
-  const earlyStageTotal = discoveryTotal + convictionTotal;
-
-  if (earlyStageTotal > deployableCapital) {
-    // Scale down if needed
-    const scaleFactor = deployableCapital / earlyStageTotal;
-    // This shouldn't happen with proper fund configuration
-    console.warn('Capital constraint hit, scaling investments');
-  }
 
   // Generate outcomes for all discovery companies
   const discoveryOutcomes: number[] = [];
   const tractionSignals: number[] = [];
 
   for (let i = 0; i < numDiscovery; i++) {
-    // Each company gets an underlying "quality" that determines outcome
-    const outcome = sampleDiscoveryOnlyMultiple(rng);
+    const outcome = sampleDiscoveryOnlyMultiple(rng, outcomeParams);
     discoveryOutcomes.push(outcome);
 
     // Traction signal is noisy observation of quality
-    const signal = Math.log(outcome + 0.1) + rng.gaussian(0, 1.0);
+    // Lower noise = better signal = better selection
+    const noiseLevel = 1.0 - (0.25 - graduationRate) * 0.5; // More selective = slightly less noise
+    const signal = Math.log(outcome + 0.1) + rng.gaussian(0, Math.max(0.5, noiseLevel));
     tractionSignals.push(signal);
   }
 
@@ -228,19 +346,17 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
   const convictionIndices = new Set(indexed.slice(0, numConviction).map(x => x.idx));
 
   // For conviction companies, resample with better distribution
-  // (they get conviction-level outcomes since we're now filtering)
   const convictionOutcomes: Map<number, number> = new Map();
   for (const idx of convictionIndices) {
-    convictionOutcomes.set(idx, sampleConvictionMultiple(rng));
+    convictionOutcomes.set(idx, sampleConvictionMultiple(rng, outcomeParams));
   }
 
-  // Follow-on allocation (best performing conviction companies)
-  // Number of follow-on investments based on reserve size
-  const avgFollowOnCheck = convictionCheckSize * 0.5; // Follow-ons typically smaller
-  const numFollowOn = Math.min(
-    Math.floor(followOnReserve / avgFollowOnCheck),
-    Math.round(numConviction * 0.4) // At most 40% of conviction portfolio
-  );
+  // Follow-on allocation
+  // Larger reserves = more follow-on investments, concentrated in winners
+  const avgFollowOnCheck = convictionCheckSize * 0.5;
+  const maxFollowOnByReserve = Math.floor(followOnReserve / avgFollowOnCheck);
+  const maxFollowOnByPortfolio = Math.round(numConviction * (0.3 + followOnReservePercent));
+  const numFollowOn = Math.min(maxFollowOnByReserve, maxFollowOnByPortfolio);
 
   // Select best conviction companies for follow-on (by outcome)
   const convictionByOutcome = Array.from(convictionIndices)
@@ -253,11 +369,8 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
   // Build cash flows
   const cashFlows: number[] = new Array(fundLife + 1).fill(0);
 
-  // Year 0: no activity
-  // Year 1: Discovery checks
+  // Year 1: Discovery + Conviction checks
   cashFlows[1] -= discoveryTotal;
-
-  // Year 1-2: Conviction checks (2-3 months after discovery, so same year in annual model)
   cashFlows[1] -= convictionTotal;
 
   // Year 2-3: Follow-on deployments
@@ -269,27 +382,25 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
   // Calculate returns
   let totalDistGross = 0;
 
-  // Discovery-only exits (years 4-10)
   for (let i = 0; i < numDiscovery; i++) {
     const exitYear = rng.randInt(4, fundLife);
 
     if (convictionIndices.has(i)) {
-      // Conviction company
       const outcome = convictionOutcomes.get(i)!;
       const invested = discoveryCheckSize + convictionCheckSize;
       let distribution = invested * outcome;
 
-      // Follow-on returns (if applicable)
       if (followOnIndices.has(i)) {
-        // Follow-on invested at higher valuation, so lower multiple
-        const followOnMultiple = Math.max(outcome / 3, 0); // ~3x step-up
+        // Follow-on invested at higher valuation
+        // Step-up depends on company trajectory - winners have higher step-ups
+        const stepUp = 2.5 + outcome * 0.1; // 2.5-5x step-up for big winners
+        const followOnMultiple = Math.max(outcome / stepUp, 0);
         distribution += followOnCheckSize * followOnMultiple;
       }
 
       cashFlows[exitYear] += distribution;
       totalDistGross += distribution;
     } else {
-      // Discovery-only company
       const outcome = discoveryOutcomes[i];
       const distribution = discoveryCheckSize * outcome;
       cashFlows[exitYear] += distribution;
@@ -301,16 +412,14 @@ export function simulateFundOnce(params: FundParams, rng: SeededRandom): Simulat
   const totalCalled = -cashFlows.filter(cf => cf < 0).reduce((a, b) => a + b, 0);
 
   const grossTvpi = totalDistGross / totalCalled;
-  const dpiGross = grossTvpi; // No recycling
+  const dpiGross = grossTvpi;
 
-  // Carry calculation
   const profit = totalDistGross - totalCalled;
   const carryPaid = Math.max(profit, 0) * carry;
   const totalDistNet = totalDistGross - carryPaid;
   const netTvpi = totalDistNet / totalCalled;
   const dpiNet = netTvpi;
 
-  // Net IRR (carry paid at end)
   const cashFlowsNet = [...cashFlows];
   cashFlowsNet[fundLife] -= carryPaid;
   const irrNet = calculateIRR(cashFlowsNet);
@@ -379,7 +488,6 @@ export function runMonteCarloSimulation(
   const dpiNets = simulations.map(s => s.dpiNet);
   const irrNets = simulations.map(s => s.irrNet);
 
-  // Probability calculations
   const probReturnFund = simulations.filter(s => s.netTvpi >= 1.0).length / numSimulations;
   const prob2x = simulations.filter(s => s.netTvpi >= 2.0).length / numSimulations;
   const prob3x = simulations.filter(s => s.netTvpi >= 3.0).length / numSimulations;
